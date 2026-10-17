@@ -1,0 +1,50 @@
+{
+  "name": "dsh-video-fetch",
+  "version": "0.1.0",
+  "description": "Video downloading for DeepSeek Harness: yt-dlp with bilibili QR login for logged-in quality, plus optional ffmpeg compression to QQ-size",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json",
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "test:live": "node test/live.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.0",
+    "@deepseek-ai/dsh-tools": "^0.1.0 || ^0.2.0 || 0.2.0-rc.2 || 0.2.1-alpha.1",
+    "@deepseek-ai/schemastery": "^3.18.0"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DataEraserC/dsh-video-fetch.git"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "plugin",
+    "yt-dlp",
+    "video"
+  ],
+  "author": "DataEraserC",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  }
+}
