@@ -84,7 +84,7 @@ await check('video_login start: real QR PNG + pending state', async () => {
   assert.ok(existsSync(qrPath), `QR PNG missing: ${qrPath}`)
   assert.ok(statSync(qrPath).size > 100, 'QR PNG too small')
   assert.ok(readFileSync(qrPath).subarray(0, 4).toString('hex') === '89504e47', 'not a PNG')
-  const state = JSON.parse(readFileSync(join(process.env.DSH_HOME, 'video-fetch', 'login.json'), 'utf8'))
+  const state = JSON.parse(readFileSync(join(process.env.DSH_HOME, 'video-fetch', 'login-bilibili.json'), 'utf8'))
   assert.ok(state.key, 'no qrcode_key persisted')
 })
 

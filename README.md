@@ -1,15 +1,16 @@
 # dsh-video-fetch
 
 Video downloading for [DeepSeek Harness](https://github.com/deepseek-ai/dsh): yt-dlp
-downloads with optional ffmpeg compression to a QQ-sendable MP4, plus bilibili
-QR login so downloads reach the logged-in quality tier.
+downloads with optional ffmpeg compression to a QQ-sendable MP4, plus per-site
+login (bilibili QR or a manually exported cookie file) so downloads reach the
+logged-in quality tier.
 
 ## Tools
 
 | Tool | What it does |
 | --- | --- |
-| `video_fetch` | Download any URL yt-dlp supports (bilibili, YouTube, …) with `yt-dlp`; returns the local file path. `compress: true` re-encodes the result in the same call. An already-downloaded URL returns the existing file. |
-| `video_login` | Bilibili QR login (`start` / `poll` / `status` / `logout`). Logged-in cookies raise the reachable quality (e.g. 1080P+). |
+| `video_fetch` | Download any URL yt-dlp supports (bilibili, YouTube, …) with `yt-dlp`; returns the local file path. A URL owned by a login site gets its cookie jars, tried in order when one fails. `compress: true` re-encodes the result in the same call. An already-downloaded URL returns the existing file. |
+| `video_login` | Per-site login on a `site` × `method` contract: `site` (currently `bilibili`), `method` = `qr` (`start` → show the PNG → `poll`), `manual` (`import` a Netscape cookie file from disk), or `password`/`sms` (reserved for future sites, currently a structured not-implemented error); plus `status` and `logout`. |
 | `video_compress` | Re-encode any local video to H.264 + AAC + faststart with a height cap, writing `<name>.small.<ext>` next to the input. |
 
 ## Configuration
@@ -32,8 +33,13 @@ user override via `ytdlpBinary` / `ffmpegBinary` still wins.
 
 ## Security
 
-- Bilibili session cookies are written to `DSH_HOME/video-fetch/cookies.txt`
-  with mode `0600` and are **never** included in tool results, logs, or commits.
+- Login cookies are stored **per site** as an array in
+  `DSH_HOME/video-fetch/cookies/<site>.json` (mode `0600`, newest first, at
+  most 5 jars per site) and are **never** included in tool results, logs, or
+  commits; `video_fetch` materializes the jar it hands to yt-dlp and rotates
+  to the next when one fails. `logout` clears only the named site.
+- `video_login action=import` takes an absolute path to a cookie file already
+  on disk — cookie values are never pasted into chat.
 - `video_fetch` accepts `http(s)` URLs only; `video_compress` accepts absolute
   local paths only. Both binaries are spawned with argv arrays (no shell).
 - Every external process has a hard deadline (SIGTERM, then SIGKILL).

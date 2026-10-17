@@ -1,6 +1,6 @@
 // Unit tests for the pure pieces: yt-dlp arg building, output parsing,
-// ffmpeg arg building, cookie serialization, and plugin registration.
-// No network, no downloads — run with `npm test`.
+// ffmpeg arg building, the cookie-jar store, provider registry, login gating,
+// and plugin registration. No network, no downloads — run with `npm test`.
 
 import assert from 'node:assert/strict'
 import { mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs'
@@ -9,7 +9,19 @@ import { join } from 'node:path'
 import { parseFetchedPath, stderrTail } from '../lib/proc.js'
 import { buildFetchArgs } from '../lib/ytdlp.js'
 import { buildCompressArgs, compressOutputPath } from '../lib/ffmpeg.js'
-import { parseSetCookies, toNetscape, cookieHeader, writeCookies } from '../lib/bili.js'
+import {
+  MAX_JARS,
+  addJar,
+  countNetscapeCookies,
+  headerFromNetscape,
+  materializeJar,
+  parseSetCookies,
+  readJars,
+  removeJars,
+  rotateJars,
+  toNetscape,
+} from '../lib/cookies.js'
+import { providerBySite, providerByUrl, siteNames } from '../lib/auth/index.js'
 
 const checks = []
 /** @param {string} name - check label. @param {() => Promise<void>|void} body - assertions. */
@@ -21,6 +33,21 @@ async function check(name, body) {
     checks.push(`FAIL ${name}: ${error.message}`)
     process.exitCode = 1
   }
+}
+
+/** Fresh DSH_HOME for a check. @returns {string} the temp dir */
+function freshHome() {
+  process.env.DSH_HOME = mkdtempSync(join(tmpdir(), 'vf-home-'))
+  return process.env.DSH_HOME
+}
+
+/** Register all tools against the current DSH_HOME. @returns {Promise<object>} name → tool */
+async function registeredTools() {
+  const mod = await import('../lib/index.js')
+  const tools = []
+  const ctx = { tools: { register: (tool) => tools.push(tool) } }
+  mod.apply(ctx, mod.Config({}))
+  return Object.fromEntries(tools.map((tool) => [tool.name, tool]))
 }
 
 // ── yt-dlp args ─────────────────────────────────────────────────────────────
@@ -80,7 +107,7 @@ await check('compressOutputPath: .small suffix, never equals input', () => {
   assert.notEqual(out, '/dir/my clip.webm')
 })
 
-// ── cookies ─────────────────────────────────────────────────────────────────
+// ── cookie codec ────────────────────────────────────────────────────────────
 
 await check('parseSetCookies: attributes, defaults, max-age override', () => {
   const cookies = parseSetCookies([
@@ -97,31 +124,110 @@ await check('parseSetCookies: attributes, defaults, max-age override', () => {
   assert.ok(Math.abs(cookies[1].expires - (Math.floor(Date.now() / 1000) + 60)) <= 5)
 })
 
-await check('toNetscape + cookieHeader: round-trip incl. HttpOnly lines', () => {
+await check('toNetscape + headerFromNetscape: round-trip incl. HttpOnly lines', () => {
   const cookies = parseSetCookies([
     'SESSDATA=abc,1; Domain=.bilibili.com; Path=/; HttpOnly; Secure',
     'bili_jct=tok; Domain=.bilibili.com; Path=/',
   ])
-  const file = toNetscape(cookies)
-  const dir = mkdtempSync(join(tmpdir(), 'vf-cookie-'))
-  const path = join(dir, 'cookies.txt')
-  writeCookies(path, file)
-  assert.equal(statSync(path).mode & 0o777, 0o600, 'cookies.txt must be 0600')
-  const header = cookieHeader(path)
-  assert.equal(header, 'SESSDATA=abc,1; bili_jct=tok')
-  const lines = readFileSync(path, 'utf8').split('\n')
-  assert.ok(lines.some((l) => l.startsWith('#HttpOnly_.bilibili.com')), 'HttpOnly marker kept')
-  assert.equal(lines[0], '# Netscape HTTP Cookie File')
+  const file = toNetscape(cookies, 'bilibili.com')
+  assert.equal(file.split('\n')[0], '# Netscape HTTP Cookie File')
+  assert.ok(file.includes('#HttpOnly_.bilibili.com'), 'HttpOnly marker kept')
+  assert.equal(headerFromNetscape(file), 'SESSDATA=abc,1; bili_jct=tok')
+  assert.equal(headerFromNetscape(''), '')
 })
 
-await check('cookieHeader: missing file → empty string', () => {
-  assert.equal(cookieHeader('/nonexistent/cookies.txt'), '')
+await check('countNetscapeCookies: header/comments skipped, HttpOnly rows counted', () => {
+  const text = [
+    '# Netscape HTTP Cookie File',
+    '# a comment, not a cookie',
+    '.bilibili.com\tTRUE\t/\tTRUE\t0\tSESSDATA\tv1',
+    '#HttpOnly_.bilibili.com\tTRUE\t/\tTRUE\t0\tbili_jct\tv2',
+    '',
+  ].join('\n')
+  assert.equal(countNetscapeCookies(text), 2)
+  assert.equal(countNetscapeCookies('hello world'), 0)
+  assert.equal(countNetscapeCookies(''), 0)
+})
+
+// ── cookie-jar array store ──────────────────────────────────────────────────
+
+await check('jar store: add → materialize round-trips Netscape at 0600', () => {
+  freshHome()
+  const data = toNetscape(parseSetCookies(['SESSDATA=abc,1; Domain=.bilibili.com; Path=/; HttpOnly']), 'bilibili.com')
+  const added = addJar('bilibili', { source: 'qr', data })
+  assert.deepEqual({ index: added.index, total: added.total, duplicate: added.duplicate }, { index: 1, total: 1, duplicate: false })
+  const path = materializeJar('bilibili', 0)
+  assert.equal(statSync(path).mode & 0o777, 0o600, 'materialized jar must be 0600')
+  assert.equal(readFileSync(path, 'utf8'), data)
+  assert.throws(() => materializeJar('bilibili', 1), /no cookie jar #2/)
+})
+
+await check('jar store: dedupe, newest first, MAX_JARS cap, per-site removal', () => {
+  freshHome()
+  addJar('bilibili', { source: 'manual', data: 'A' })
+  const dup = addJar('bilibili', { source: 'qr', data: 'A' })
+  assert.equal(dup.duplicate, true)
+  assert.equal(dup.index, 1, 'duplicate reports the existing jar position')
+  let last = null
+  for (const data of ['B', 'C', 'D', 'E']) last = addJar('bilibili', { source: 'manual', data })
+  assert.equal(last.trimmed, false, 'cap not reached yet')
+  const overflow = addJar('bilibili', { source: 'manual', data: 'F' })
+  assert.equal(overflow.trimmed, true)
+  const jars = readJars('bilibili')
+  assert.equal(jars.length, MAX_JARS)
+  assert.equal(jars[0].data, 'F', 'newest first')
+  assert.equal(readJars('other-site').length, 0, 'sites do not share jars')
+  assert.equal(removeJars('bilibili'), MAX_JARS)
+  assert.equal(readJars('bilibili').length, 0)
+  assert.equal(removeJars('bilibili'), 0, 'second removal is a no-op')
+})
+
+await check('rotateJars: rotates past failures and reports the jar that worked', async () => {
+  const jars = [{ data: '1' }, { data: '2' }, { data: '3' }]
+  const seen = []
+  const result = await rotateJars(jars, {
+    useJar: (i) => { seen.push(i); return `/jar${i}` },
+    attempt: async (p) => {
+      if (p === '/jar0') throw new Error('jar rejected')
+      return `kept:${p}`
+    },
+  })
+  assert.deepEqual(seen, [0, 1], 'second jar tried after the first failed')
+  assert.equal(result.value, 'kept:/jar1')
+  assert.equal(result.index, 1)
+})
+
+await check('rotateJars: throws the LAST error; stop() halts before attempting', async () => {
+  await assert.rejects(
+    () => rotateJars([{}, {}], { useJar: (i) => `/j${i}`, attempt: async (p) => { throw new Error(`fail:${p}`) } }),
+    /fail:\/j1/,
+    'the last attempt’s error is what surfaces',
+  )
+  let attempts = 0
+  await assert.rejects(
+    () => rotateJars([{}, {}], { useJar: (i) => `/j${i}`, attempt: async () => { attempts += 1 }, stop: () => true }),
+    /no cookie jars available/,
+  )
+  assert.equal(attempts, 0, 'stop() before the first attempt runs nothing')
+})
+
+// ── provider registry ───────────────────────────────────────────────────────
+
+await check('registry: bilibili routing by host; unknown site/url → null', () => {
+  assert.deepEqual(siteNames(), ['bilibili'])
+  assert.equal(providerByUrl('https://www.bilibili.com/video/BV1xx411c7mD')?.site, 'bilibili')
+  assert.equal(providerByUrl('https://b23.tv/abc')?.site, 'bilibili')
+  assert.equal(providerByUrl('https://youtube.com/watch?v=x'), null)
+  assert.equal(providerByUrl('not a url'), null)
+  assert.equal(providerBySite('bilibili')?.methods.includes('qr'), true)
+  assert.equal(providerBySite('bilibili')?.methods.includes('manual'), true)
+  assert.equal(providerBySite('youtube'), null)
 })
 
 // ── plugin registration ─────────────────────────────────────────────────────
 
 await check('apply: registers 3 tools with the right names + config defaults', async () => {
-  process.env.DSH_HOME = mkdtempSync(join(tmpdir(), 'vf-home-'))
+  freshHome()
   const mod = await import('../lib/index.js')
   const tools = []
   const ctx = { tools: { register: (tool) => tools.push(tool) } }
@@ -135,33 +241,89 @@ await check('apply: registers 3 tools with the right names + config defaults', a
 })
 
 await check('video_fetch: rejects non-http(s) URL before touching the network', async () => {
-  const mod = await import('../lib/index.js')
-  const tools = []
-  const ctx = { tools: { register: (tool) => tools.push(tool) } }
-  mod.apply(ctx, mod.Config({}))
-  const fetchTool = tools.find((t) => t.name === 'video_fetch')
-  await assert.rejects(() => fetchTool.execute({ url: 'file:///etc/passwd' }, {}), /unsupported URL scheme/)
+  freshHome()
+  const tools = await registeredTools()
+  await assert.rejects(() => tools.video_fetch.execute({ url: 'file:///etc/passwd' }, {}), /unsupported URL scheme/)
 })
 
 await check('video_compress: rejects relative and missing paths', async () => {
-  const mod = await import('../lib/index.js')
-  const tools = []
-  const ctx = { tools: { register: (tool) => tools.push(tool) } }
-  mod.apply(ctx, mod.Config({}))
-  const compressTool = tools.find((t) => t.name === 'video_compress')
-  await assert.rejects(() => compressTool.execute({ file: 'relative.mp4' }, {}), /absolute path/)
-  await assert.rejects(() => compressTool.execute({ file: '/nonexistent/file.mp4' }, {}), /not a file/)
+  freshHome()
+  const tools = await registeredTools()
+  await assert.rejects(() => tools.video_compress.execute({ file: 'relative.mp4' }, {}), /absolute path/)
+  await assert.rejects(() => tools.video_compress.execute({ file: '/nonexistent/file.mp4' }, {}), /not a file/)
 })
 
 await check('video_login: poll without pending state says so', async () => {
-  process.env.DSH_HOME = mkdtempSync(join(tmpdir(), 'vf-home2-'))
-  const mod = await import('../lib/index.js')
-  const tools = []
-  const ctx = { tools: { register: (tool) => tools.push(tool) } }
-  mod.apply(ctx, mod.Config({}))
-  const loginTool = tools.find((t) => t.name === 'video_login')
-  const result = await loginTool.execute({ action: 'poll' }, {})
+  freshHome()
+  const tools = await registeredTools()
+  const result = await tools.video_login.execute({ action: 'poll' }, {})
   assert.match(result.text, /action=start first/)
+})
+
+await check('video_login: site × method contract — unknowns, reserved methods, wrong action', async () => {
+  freshHome()
+  const tools = await registeredTools()
+  // Schema layer rejects unknown enum values before execute runs.
+  await assert.rejects(
+    () => tools.video_login.execute({ action: 'start', site: 'youtube' }, {}),
+    /"site" must be one of \["bilibili"\]/,
+  )
+  await assert.rejects(
+    () => tools.video_login.execute({ action: 'start', method: 'magic' }, {}),
+    /"method" must be one of/,
+  )
+  // Reserved-but-listed methods reach execute and fail with the contract error.
+  await assert.rejects(
+    () => tools.video_login.execute({ action: 'start', method: 'password' }, {}),
+    /method=password is reserved but not implemented for site=bilibili \(implemented: qr, manual\)/,
+  )
+  await assert.rejects(
+    () => tools.video_login.execute({ action: 'import' }, {}),
+    /action=import is not valid for method=qr.*use method=manual/,
+  )
+  await assert.rejects(
+    () => tools.video_login.execute({ action: 'start', method: 'manual' }, {}),
+    /action=start is not valid for method=manual/,
+  )
+})
+
+await check('video_login: manual import stores a jar; logout clears only that site', async () => {
+  freshHome()
+  const exportDir = mkdtempSync(join(tmpdir(), 'vf-export-'))
+  const cookieFile = join(exportDir, 'export.txt')
+  writeFileSync(cookieFile, toNetscape(parseSetCookies(['SESSDATA=secret; Domain=.bilibili.com; Path=/; HttpOnly']), 'bilibili.com'))
+  const tools = await registeredTools()
+
+  const imported = await tools.video_login.execute({ action: 'import', method: 'manual', path: cookieFile }, {})
+  assert.match(imported.text, /Imported 1 cookie\(s\) for bilibili as jar 1 of 1/)
+  assert.ok(!imported.text.includes('secret'), 'cookie value must never reach the result')
+
+  const again = await tools.video_login.execute({ action: 'import', method: 'manual', path: cookieFile }, {})
+  assert.match(again.text, /Already stored as jar 1 of 1/)
+
+  await assert.rejects(
+    () => tools.video_login.execute({ action: 'import', method: 'manual', path: 'relative.txt' }, {}),
+    /absolute path/,
+  )
+  const junk = join(exportDir, 'junk.txt')
+  writeFileSync(junk, 'hello world')
+  await assert.rejects(
+    () => tools.video_login.execute({ action: 'import', method: 'manual', path: junk }, {}),
+    /no cookie rows/,
+  )
+
+  const loggedOut = await tools.video_login.execute({ action: 'logout' }, {}) // default method=qr
+  assert.match(loggedOut.text, /Cookies deleted for bilibili \(1 jar\(s\)\)/)
+  assert.equal(readJars('bilibili').length, 0)
+  const againOut = await tools.video_login.execute({ action: 'logout' }, {})
+  assert.match(againOut.text, /Already logged out/)
+})
+
+await check('video_login: status with no cookies is offline and says so', async () => {
+  freshHome()
+  const tools = await registeredTools()
+  const result = await tools.video_login.execute({ action: 'status' }, {})
+  assert.equal(result.text, 'Not logged in (no cookies for bilibili).')
 })
 
 console.log(checks.join('\n'))
