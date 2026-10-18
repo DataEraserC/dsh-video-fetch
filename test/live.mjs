@@ -14,10 +14,13 @@
 import assert from 'node:assert/strict'
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 process.env.DSH_HOME = mkdtempSync(join(tmpdir(), 'vf-live-home-'))
-const downloadDir = mkdtempSync(join(tmpdir(), 'vf-live-dl-'))
+// video_fetch downloads only land inside the session workspace, so the fake
+// session exec below carries this dir as its header cwd.
+const workspace = mkdtempSync(join(tmpdir(), 'vf-live-ws-'))
+const exec = { agent: { session: { header: { cwd: workspace } } } }
 
 const VIDEO_URL = 'https://www.bilibili.com/video/BV1DmJX6SEqU' // ~111s, short & stable
 const checks = []
@@ -34,7 +37,7 @@ async function check(name, body) {
 const mod = await import('../lib/index.js')
 const tools = []
 const ctx = { tools: { register: (tool) => tools.push(tool) } }
-const config = mod.Config({ downloadDir, fetchTimeoutMs: 300000, compressTimeoutMs: 300000 })
+const config = mod.Config({ fetchTimeoutMs: 300000, compressTimeoutMs: 300000 })
 mod.apply(ctx, config)
 const fetchTool = tools.find((t) => t.name === 'video_fetch')
 const compressTool = tools.find((t) => t.name === 'video_compress')
@@ -43,7 +46,7 @@ const loginTool = tools.find((t) => t.name === 'video_login')
 let downloadedPath = ''
 
 await check('video_fetch: real bilibili download returns an existing file', async () => {
-  const r = await fetchTool.execute({ url: VIDEO_URL }, {})
+  const r = await fetchTool.execute({ url: VIDEO_URL }, exec)
   downloadedPath = r.text.match(/^(?:Downloaded|Already downloaded): (.+)$/m)?.[1]
   assert.ok(downloadedPath, `no path in result:\n${r.text}`)
   assert.ok(existsSync(downloadedPath), 'file missing')
@@ -51,16 +54,20 @@ await check('video_fetch: real bilibili download returns an existing file', asyn
   assert.match(r.text, /Size: [\d.]+ MB/)
 })
 
+await check('video_fetch: the download landed inside the session workspace (default subdir)', () => {
+  assert.equal(dirname(downloadedPath), join(workspace, 'dsh-video-fetch'), 'expected the workspace default subdir')
+})
+
 await check('video_fetch: second run returns the same file without re-downloading', async () => {
   const mtimeBefore = statSync(downloadedPath).mtimeMs
-  const r = await fetchTool.execute({ url: VIDEO_URL }, {})
+  const r = await fetchTool.execute({ url: VIDEO_URL }, exec)
   const again = r.text.match(/^Downloaded: (.+)$/m)?.[1]
   assert.equal(again, downloadedPath, 'same path expected')
   assert.equal(statSync(downloadedPath).mtimeMs, mtimeBefore, 'file was re-downloaded (mtime changed)')
 })
 
 await check('video_fetch: compress=true produces .small.mp4 via ffmpeg', async () => {
-  const r = await fetchTool.execute({ url: VIDEO_URL, compress: true }, {})
+  const r = await fetchTool.execute({ url: VIDEO_URL, compress: true }, exec)
   const out = r.text.match(/^Compressed: (.+?)(?: \(| \d|\n|$)/m)?.[1]
   assert.ok(out, `no compressed line:\n${r.text}`)
   assert.ok(existsSync(out), `compressed file missing: ${out}`)
@@ -100,7 +107,7 @@ await check('video_login status: no cookies → not logged in', async () => {
 
 // ── cleanup (script-created scratch only) ───────────────────────────────────
 rmSync(process.env.DSH_HOME, { recursive: true, force: true })
-rmSync(downloadDir, { recursive: true, force: true })
+rmSync(workspace, { recursive: true, force: true })
 
 console.log(checks.join('\n'))
 console.log(`\n${checks.filter((c) => c.startsWith('ok')).length}/${checks.length} passed`)

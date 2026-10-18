@@ -3,9 +3,9 @@
 // and plugin registration. No network, no downloads — run with `npm test`.
 
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { parseFetchedPath, stderrTail } from '../lib/proc.js'
 import { buildFetchArgs } from '../lib/ytdlp.js'
 import { buildCompressArgs, compressOutputPath } from '../lib/ffmpeg.js'
@@ -258,6 +258,47 @@ await check('video_compress: rejects relative and missing paths', async () => {
   await assert.rejects(() => tools.video_compress.execute({ file: '/nonexistent/file.mp4' }, {}), /not a file/)
 })
 
+// ── workspace containment (video_fetch downloads) ──────────────────────────
+
+await check('downloadDir: resolves only inside the session workspace', async () => {
+  const mod = await import('../lib/index.js')
+  const ws = mkdtempSync(join(tmpdir(), 'vf-ws-'))
+  const exec = { agent: { session: { header: { cwd: ws } } } }
+  assert.equal(mod.downloadDirOf(mod.Config({}), exec), join(ws, 'dsh-video-fetch'))
+  assert.equal(mod.downloadDirOf(mod.Config({ downloadDir: 'clips' }), exec), join(ws, 'clips'))
+  assert.equal(mod.downloadDirOf(mod.Config({ downloadDir: '.' }), exec), resolve(ws))
+  assert.throws(() => mod.downloadDirOf(mod.Config({ downloadDir: '/etc/videos' }), exec), /inside the session workspace/)
+  assert.throws(() => mod.downloadDirOf(mod.Config({ downloadDir: '../evil' }), exec), /inside the session workspace/)
+  rmSync(ws, { recursive: true, force: true })
+})
+
+await check('downloadDir: no session workspace → fail closed before any fs write', async () => {
+  const mod = await import('../lib/index.js')
+  const config = mod.Config({})
+  assert.throws(() => mod.downloadDirOf(config, undefined), /no session workspace/)
+  assert.throws(() => mod.downloadDirOf(config, {}), /no session workspace/)
+  assert.throws(() => mod.downloadDirOf(config, { agent: { session: { header: {} } } }), /no session workspace/)
+})
+
+await check('downloadDir: a symlink in the workspace cannot redirect downloads out of it', async () => {
+  const mod = await import('../lib/index.js')
+  const ws = mkdtempSync(join(tmpdir(), 'vf-ws-'))
+  const outside = mkdtempSync(join(tmpdir(), 'vf-out-'))
+  symlinkSync(outside, join(ws, 'clips'))
+  assert.throws(
+    () => mod.downloadDirOf(mod.Config({ downloadDir: 'clips' }), { agent: { session: { header: { cwd: ws } } } }),
+    /resolves outside/,
+  )
+  rmSync(ws, { recursive: true, force: true })
+  rmSync(outside, { recursive: true, force: true })
+})
+
+await check('video_fetch: fails closed before the network when the session has no workspace', async () => {
+  freshHome()
+  const tools = await registeredTools()
+  await assert.rejects(() => tools.video_fetch.execute({ url: 'https://example.com/v' }, {}), /no session workspace/)
+})
+
 // ── settings contract (shared by video_settings and the web page) ───────────
 
 await check('settings: coerceValue enforces type, range, enum, and bitrate shape', () => {
@@ -271,6 +312,10 @@ await check('settings: coerceValue enforces type, range, enum, and bitrate shape
   assert.equal(coerceValue('audioBitrate', '192k'), '192k')
   assert.throws(() => coerceValue('audioBitrate', 'loud'), /must look like/)
   assert.throws(() => coerceValue('format', '  '), /must not be empty/)
+  assert.equal(coerceValue('downloadDir', ''), '')
+  assert.equal(coerceValue('downloadDir', 'clips'), 'clips')
+  assert.throws(() => coerceValue('downloadDir', '/etc/videos'), /inside the session workspace/)
+  assert.throws(() => coerceValue('downloadDir', '../evil'), /inside the session workspace/)
   assert.throws(() => coerceValue('nope', 1), /unknown setting/)
 })
 
@@ -283,7 +328,7 @@ await check('settings: coercePatch validates the whole patch before any write', 
 
 await check('settings: snapshot unwraps volatile refs and covers every editable key', () => {
   const config = {
-    downloadDir: { get: () => '/videos' },
+    downloadDir: { get: () => 'clips' },
     format: { get: () => 'bv*+ba/b' },
     crf: { get: () => 20 },
     maxHeight: 720,
@@ -294,7 +339,7 @@ await check('settings: snapshot unwraps volatile refs and covers every editable 
   assert.deepEqual(Object.keys(values), [...EDITABLE_KEYS])
   assert.equal(values.crf, 20)
   assert.equal(values.maxHeight, 720)
-  assert.equal(values.downloadDir, '/videos')
+  assert.equal(values.downloadDir, 'clips')
 })
 
 await check('settings: video_settings action=get prints live values without writing', async () => {

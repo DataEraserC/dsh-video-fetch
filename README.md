@@ -13,7 +13,7 @@ applies to the running plugin immediately and survives a restart.
 
 | Tool | What it does |
 | --- | --- |
-| `video_fetch` | Download any URL yt-dlp supports (bilibili, YouTube, …) with `yt-dlp`; returns the local file path. A URL owned by a login site gets its cookie jars, tried in order when one fails. `compress: true` re-encodes the result in the same call; `crf` / `maxHeight` override the settings for that call only. An already-downloaded URL returns the existing file. |
+| `video_fetch` | Download any URL yt-dlp supports (bilibili, YouTube, …) with `yt-dlp`; returns the local file path. Files land inside the session workspace only (see Security). A URL owned by a login site gets its cookie jars, tried in order when one fails. `compress: true` re-encodes the result in the same call; `crf` / `maxHeight` override the settings for that call only. An already-downloaded URL returns the existing file. |
 | `video_login` | Per-site login on a `site` × `method` contract: `site` (currently `bilibili`), `method` = `qr` (`start` → show the PNG → `poll`), `manual` (`import` a Netscape cookie file from disk), or `password`/`sms` (reserved for future sites, currently a structured not-implemented error); plus `status` and `logout`. |
 | `video_compress` | Re-encode any local video to H.264 + AAC + faststart with a height cap, writing `<name>.small.<ext>` next to the input. |
 | `video_settings` | `get` reads the live values, `set patch={…}` writes them into the active profile's Cordis patch and applies them immediately, `reset` drops the override and restores the inherited value. Same fields and the same validation as the web page. |
@@ -41,7 +41,7 @@ Tunable at runtime (volatile: a write updates the running plugin in place):
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `downloadDir` | `~/Videos/dsh-video-fetch` | Where downloads land |
+| `downloadDir` | `dsh-video-fetch` | Download subdir, resolved inside the session workspace (absolute paths rejected) |
 | `format` | `bv*+ba/b` | yt-dlp format selector |
 | `crf` / `maxHeight` / `audioBitrate` / `preset` | 26 / 720 / `128k` / `medium` | ffmpeg re-encode settings |
 
@@ -71,6 +71,12 @@ user override via `ytdlpBinary` / `ffmpegBinary` still wins.
   on disk — cookie values are never pasted into chat.
 - `video_fetch` accepts `http(s)` URLs only; `video_compress` accepts absolute
   local paths only. Both binaries are spawned with argv arrays (no shell).
+- `video_fetch` downloads **only inside the session workspace**: `downloadDir`
+  is a workspace-relative subdir (default `dsh-video-fetch`), absolute paths and
+  `..` are rejected on write and again at use, and the resolved directory's
+  nearest existing ancestor is realpath-checked against the workspace so a
+  symlink planted inside it cannot redirect a download out. A call with no
+  session workspace fails closed before touching the filesystem.
 - Every external process has a hard deadline (SIGTERM, then SIGKILL).
 
 ## Development
