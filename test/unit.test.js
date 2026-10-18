@@ -22,6 +22,8 @@ import {
   toNetscape,
 } from '../lib/cookies.js'
 import { providerBySite, providerByUrl, siteNames } from '../lib/auth/index.js'
+import { EDITABLE_KEYS, coercePatch, coerceValue, plain, snapshot } from '../lib/settings.js'
+import { buildRoutes } from '../lib/routes.js'
 
 const checks = []
 /** @param {string} name - check label. @param {() => Promise<void>|void} body - assertions. */
@@ -226,18 +228,21 @@ await check('registry: bilibili routing by host; unknown site/url → null', () 
 
 // ── plugin registration ─────────────────────────────────────────────────────
 
-await check('apply: registers 3 tools with the right names + config defaults', async () => {
+await check('apply: registers 4 tools with the right names + config defaults', async () => {
   freshHome()
   const mod = await import('../lib/index.js')
   const tools = []
   const ctx = { tools: { register: (tool) => tools.push(tool) } }
   const config = mod.Config({})
-  assert.equal(config.crf, 26)
-  assert.equal(config.maxHeight, 720)
-  assert.equal(config.format, 'bv*+ba/b')
+  // The tunable fields are volatile refs; plain() is the read side.
+  assert.equal(plain(config.crf), 26)
+  assert.equal(plain(config.maxHeight), 720)
+  assert.equal(plain(config.format), 'bv*+ba/b')
+  assert.equal(plain(config.audioBitrate), '128k')
+  assert.equal(plain(config.preset), 'medium')
   assert.equal(config.ytdlpBinary, 'yt-dlp')
   mod.apply(ctx, config)
-  assert.deepEqual(tools.map((t) => t.name), ['video_fetch', 'video_login', 'video_compress'])
+  assert.deepEqual(tools.map((t) => t.name), ['video_fetch', 'video_login', 'video_compress', 'video_settings'])
 })
 
 await check('video_fetch: rejects non-http(s) URL before touching the network', async () => {
@@ -251,6 +256,67 @@ await check('video_compress: rejects relative and missing paths', async () => {
   const tools = await registeredTools()
   await assert.rejects(() => tools.video_compress.execute({ file: 'relative.mp4' }, {}), /absolute path/)
   await assert.rejects(() => tools.video_compress.execute({ file: '/nonexistent/file.mp4' }, {}), /not a file/)
+})
+
+// ── settings contract (shared by video_settings and the web page) ───────────
+
+await check('settings: coerceValue enforces type, range, enum, and bitrate shape', () => {
+  assert.equal(coerceValue('crf', '22'), 22)
+  assert.equal(coerceValue('crf', 22), 22)
+  assert.equal(coerceValue('maxHeight', 0), 0)
+  assert.throws(() => coerceValue('crf', 60), /must be 0-51/)
+  assert.throws(() => coerceValue('crf', 1.5), /must be an integer/)
+  assert.throws(() => coerceValue('preset', 'nope'), /must be one of/)
+  assert.equal(coerceValue('preset', 'veryfast'), 'veryfast')
+  assert.equal(coerceValue('audioBitrate', '192k'), '192k')
+  assert.throws(() => coerceValue('audioBitrate', 'loud'), /must look like/)
+  assert.throws(() => coerceValue('format', '  '), /must not be empty/)
+  assert.throws(() => coerceValue('nope', 1), /unknown setting/)
+})
+
+await check('settings: coercePatch validates the whole patch before any write', () => {
+  assert.deepEqual(coercePatch({ crf: '22', maxHeight: 480 }), { crf: 22, maxHeight: 480 })
+  assert.throws(() => coercePatch({}), /is empty/)
+  assert.throws(() => coercePatch(null), /must be an object/)
+  assert.throws(() => coercePatch({ crf: 22, preset: 'nope' }), /must be one of/)
+})
+
+await check('settings: snapshot unwraps volatile refs and covers every editable key', () => {
+  const config = {
+    downloadDir: { get: () => '/videos' },
+    format: { get: () => 'bv*+ba/b' },
+    crf: { get: () => 20 },
+    maxHeight: 720,
+    audioBitrate: { get: () => '128k' },
+    preset: { get: () => 'medium' },
+  }
+  const values = snapshot(config)
+  assert.deepEqual(Object.keys(values), [...EDITABLE_KEYS])
+  assert.equal(values.crf, 20)
+  assert.equal(values.maxHeight, 720)
+  assert.equal(values.downloadDir, '/videos')
+})
+
+await check('settings: video_settings action=get prints live values without writing', async () => {
+  freshHome()
+  const tools = await registeredTools()
+  const result = await tools.video_settings.execute({ action: 'get' }, {})
+  assert.match(result.text, /crf = 26/)
+  assert.match(result.text, /maxHeight = 720/)
+  assert.match(result.text, /preset = "medium"/)
+})
+
+await check('settings: action=set without configEditor fails loudly, never silently', async () => {
+  freshHome()
+  const tools = await registeredTools()
+  await assert.rejects(
+    () => tools.video_settings.execute({ action: 'set', patch: { crf: 22 } }, {}),
+    /configEditor is unavailable/,
+  )
+  await assert.rejects(
+    () => tools.video_settings.execute({ action: 'set', patch: { crf: 99 } }, {}),
+    /must be 0-51/,
+  )
 })
 
 await check('video_login: poll without pending state says so', async () => {
@@ -324,6 +390,96 @@ await check('video_login: status with no cookies is offline and says so', async 
   const tools = await registeredTools()
   const result = await tools.video_login.execute({ action: 'status' }, {})
   assert.equal(result.text, 'Not logged in (no cookies for bilibili).')
+})
+
+// ── web routes (the Plugins-page surface) ───────────────────────────────────
+
+/** Drive one route with a fake request/response pair. @returns {Promise<{status: number, body: any}>} */
+async function callRoute(routes, path, body) {
+  const route = routes.find((entry) => entry.path === path.split('?')[0])
+  assert.ok(route, `route ${path} exists`)
+  const chunks = body === undefined ? [] : [Buffer.from(JSON.stringify(body))]
+  const req = Object.assign(
+    (function* () { for (const chunk of chunks) yield chunk })(),
+    { method: body === undefined ? 'GET' : 'POST', url: path },
+  )
+  let payload = ''
+  const res = {
+    statusCode: 200,
+    headers: {},
+    setHeader(key, value) { this.headers[key] = value },
+    end(value) { payload = value === undefined ? '' : String(value) },
+  }
+  await route.handler(req, res)
+  let parsed
+  try { parsed = JSON.parse(payload) } catch { parsed = payload }
+  return { status: res.statusCode, body: parsed }
+}
+
+await check('routes: state reports live settings, the field table, and jar counts', async () => {
+  freshHome()
+  const mod = await import('../lib/index.js')
+  const config = mod.Config({})
+  const routes = buildRoutes({ get: () => undefined }, config)
+  const { status, body } = await callRoute(routes, '/video-fetch/state')
+  assert.equal(status, 200)
+  assert.equal(body.settings.crf, 26)
+  assert.equal(body.settings.maxHeight, 720)
+  assert.deepEqual(body.fields.map((field) => field.key), [...EDITABLE_KEYS])
+  const crf = body.fields.find((field) => field.key === 'crf')
+  assert.deepEqual({ min: crf.min, max: crf.max, type: crf.type }, { min: 0, max: 51, type: 'integer' })
+  assert.deepEqual(body.sites, [{ site: 'bilibili', jars: 0 }])
+})
+
+await check('routes: set rejects a bad value with 400 and never writes', async () => {
+  freshHome()
+  const mod = await import('../lib/index.js')
+  const routes = buildRoutes({ get: () => undefined }, mod.Config({}))
+  const bad = await callRoute(routes, '/video-fetch/set', { patch: { crf: 99 } })
+  assert.equal(bad.status, 400)
+  assert.match(bad.body.error, /must be 0-51/)
+  const unknown = await callRoute(routes, '/video-fetch/set', { patch: { nope: 1 } })
+  assert.equal(unknown.status, 400)
+  assert.match(unknown.body.error, /unknown setting/)
+})
+
+await check('routes: set/reset fail loudly when the host has no configEditor', async () => {
+  freshHome()
+  const mod = await import('../lib/index.js')
+  const routes = buildRoutes({ get: () => undefined }, mod.Config({}))
+  const set = await callRoute(routes, '/video-fetch/set', { patch: { crf: 22 } })
+  assert.equal(set.status, 400)
+  assert.match(set.body.error, /configEditor is unavailable/)
+  const reset = await callRoute(routes, '/video-fetch/reset', {})
+  assert.equal(reset.status, 400)
+  assert.match(reset.body.error, /configEditor is unavailable/)
+})
+
+await check('routes: login status is offline-safe; QR route 404s before a login', async () => {
+  freshHome()
+  const mod = await import('../lib/index.js')
+  const routes = buildRoutes({ get: () => undefined }, mod.Config({}))
+  const status = await callRoute(routes, '/video-fetch/login/status')
+  assert.equal(status.status, 200)
+  assert.equal(status.body.loggedIn, false)
+  assert.equal(status.body.jars, 0)
+  assert.deepEqual(status.body.methods, ['qr', 'manual'])
+  const unknown = await callRoute(routes, '/video-fetch/login/status?site=youtube')
+  assert.equal(unknown.status, 400)
+  const qr = await callRoute(routes, '/video-fetch/qr')
+  assert.equal(qr.status, 404)
+  assert.match(qr.body.error, /no QR code yet/)
+})
+
+await check('routes: logout clears jars and is idempotent', async () => {
+  freshHome()
+  const mod = await import('../lib/index.js')
+  const routes = buildRoutes({ get: () => undefined }, mod.Config({}))
+  addJar('bilibili', { source: 'manual', data: 'A' })
+  const first = await callRoute(routes, '/video-fetch/login/logout', {})
+  assert.deepEqual(first.body, { ok: true, site: 'bilibili', removed: 1 })
+  const second = await callRoute(routes, '/video-fetch/login/logout', {})
+  assert.equal(second.body.removed, 0)
 })
 
 console.log(checks.join('\n'))
