@@ -1,6 +1,6 @@
 {
   "name": "dsh-video-fetch",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Video downloading for DeepSeek Harness: yt-dlp with bilibili QR login for logged-in quality, plus optional ffmpeg compression to QQ-size",
   "type": "module",
   "main": "lib/index.js",
@@ -36,6 +36,7 @@
     "@deepseek-ai/schemastery": "^3.18.0"
   },
   "dependencies": {
+    "koffi": "^3.3.3",
     "qrcode": "^1.5.4"
   },
   "repository": {

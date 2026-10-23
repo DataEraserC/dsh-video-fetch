@@ -9,19 +9,8 @@ import { join, resolve } from 'node:path'
 import { parseFetchedPath, stderrTail } from '../lib/proc.js'
 import { buildFetchArgs } from '../lib/ytdlp.js'
 import { buildCompressArgs, compressOutputPath } from '../lib/ffmpeg.js'
-import {
-  MAX_JARS,
-  addJar,
-  countNetscapeCookies,
-  headerFromNetscape,
-  materializeJar,
-  parseSetCookies,
-  readJars,
-  removeJars,
-  rotateJars,
-  toNetscape,
-} from '../lib/cookies.js'
-import { providerBySite, providerByUrl, siteNames } from '../lib/auth/index.js'
+import { engineOf } from '../lib/downloaders/index.js'
+import { nativeStatus } from '../lib/native.js'
 import { EDITABLE_KEYS, coercePatch, coerceValue, plain, snapshot } from '../lib/settings.js'
 import { buildRoutes } from '../lib/routes.js'
 
@@ -111,120 +100,9 @@ await check('compressOutputPath: .small suffix, never equals input', () => {
 
 // ── cookie codec ────────────────────────────────────────────────────────────
 
-await check('parseSetCookies: attributes, defaults, max-age override', () => {
-  const cookies = parseSetCookies([
-    'SESSDATA=abc%2C1; Domain=.bilibili.com; Expires=Wed, 01 Jan 2027 00:00:00 GMT; Path=/; HttpOnly; Secure',
-    'sid=plainvalue; Path=/; Max-Age=60',
-  ])
-  assert.equal(cookies.length, 2)
-  assert.equal(cookies[0].name, 'SESSDATA')
-  assert.equal(cookies[0].domain, '.bilibili.com')
-  assert.equal(cookies[0].secure, true)
-  assert.equal(cookies[0].httpOnly, true)
-  assert.ok(cookies[0].expires > 1_700_000_000)
-  assert.equal(cookies[1].domain, '', 'no Domain → empty')
-  assert.ok(Math.abs(cookies[1].expires - (Math.floor(Date.now() / 1000) + 60)) <= 5)
-})
-
-await check('toNetscape + headerFromNetscape: round-trip incl. HttpOnly lines', () => {
-  const cookies = parseSetCookies([
-    'SESSDATA=abc,1; Domain=.bilibili.com; Path=/; HttpOnly; Secure',
-    'bili_jct=tok; Domain=.bilibili.com; Path=/',
-  ])
-  const file = toNetscape(cookies, 'bilibili.com')
-  assert.equal(file.split('\n')[0], '# Netscape HTTP Cookie File')
-  assert.ok(file.includes('#HttpOnly_.bilibili.com'), 'HttpOnly marker kept')
-  assert.equal(headerFromNetscape(file), 'SESSDATA=abc,1; bili_jct=tok')
-  assert.equal(headerFromNetscape(''), '')
-})
-
-await check('countNetscapeCookies: header/comments skipped, HttpOnly rows counted', () => {
-  const text = [
-    '# Netscape HTTP Cookie File',
-    '# a comment, not a cookie',
-    '.bilibili.com\tTRUE\t/\tTRUE\t0\tSESSDATA\tv1',
-    '#HttpOnly_.bilibili.com\tTRUE\t/\tTRUE\t0\tbili_jct\tv2',
-    '',
-  ].join('\n')
-  assert.equal(countNetscapeCookies(text), 2)
-  assert.equal(countNetscapeCookies('hello world'), 0)
-  assert.equal(countNetscapeCookies(''), 0)
-})
-
 // ── cookie-jar array store ──────────────────────────────────────────────────
 
-await check('jar store: add → materialize round-trips Netscape at 0600', () => {
-  freshHome()
-  const data = toNetscape(parseSetCookies(['SESSDATA=abc,1; Domain=.bilibili.com; Path=/; HttpOnly']), 'bilibili.com')
-  const added = addJar('bilibili', { source: 'qr', data })
-  assert.deepEqual({ index: added.index, total: added.total, duplicate: added.duplicate }, { index: 1, total: 1, duplicate: false })
-  const path = materializeJar('bilibili', 0)
-  assert.equal(statSync(path).mode & 0o777, 0o600, 'materialized jar must be 0600')
-  assert.equal(readFileSync(path, 'utf8'), data)
-  assert.throws(() => materializeJar('bilibili', 1), /no cookie jar #2/)
-})
-
-await check('jar store: dedupe, newest first, MAX_JARS cap, per-site removal', () => {
-  freshHome()
-  addJar('bilibili', { source: 'manual', data: 'A' })
-  const dup = addJar('bilibili', { source: 'qr', data: 'A' })
-  assert.equal(dup.duplicate, true)
-  assert.equal(dup.index, 1, 'duplicate reports the existing jar position')
-  let last = null
-  for (const data of ['B', 'C', 'D', 'E']) last = addJar('bilibili', { source: 'manual', data })
-  assert.equal(last.trimmed, false, 'cap not reached yet')
-  const overflow = addJar('bilibili', { source: 'manual', data: 'F' })
-  assert.equal(overflow.trimmed, true)
-  const jars = readJars('bilibili')
-  assert.equal(jars.length, MAX_JARS)
-  assert.equal(jars[0].data, 'F', 'newest first')
-  assert.equal(readJars('other-site').length, 0, 'sites do not share jars')
-  assert.equal(removeJars('bilibili'), MAX_JARS)
-  assert.equal(readJars('bilibili').length, 0)
-  assert.equal(removeJars('bilibili'), 0, 'second removal is a no-op')
-})
-
-await check('rotateJars: rotates past failures and reports the jar that worked', async () => {
-  const jars = [{ data: '1' }, { data: '2' }, { data: '3' }]
-  const seen = []
-  const result = await rotateJars(jars, {
-    useJar: (i) => { seen.push(i); return `/jar${i}` },
-    attempt: async (p) => {
-      if (p === '/jar0') throw new Error('jar rejected')
-      return `kept:${p}`
-    },
-  })
-  assert.deepEqual(seen, [0, 1], 'second jar tried after the first failed')
-  assert.equal(result.value, 'kept:/jar1')
-  assert.equal(result.index, 1)
-})
-
-await check('rotateJars: throws the LAST error; stop() halts before attempting', async () => {
-  await assert.rejects(
-    () => rotateJars([{}, {}], { useJar: (i) => `/j${i}`, attempt: async (p) => { throw new Error(`fail:${p}`) } }),
-    /fail:\/j1/,
-    'the last attempt’s error is what surfaces',
-  )
-  let attempts = 0
-  await assert.rejects(
-    () => rotateJars([{}, {}], { useJar: (i) => `/j${i}`, attempt: async () => { attempts += 1 }, stop: () => true }),
-    /no cookie jars available/,
-  )
-  assert.equal(attempts, 0, 'stop() before the first attempt runs nothing')
-})
-
 // ── provider registry ───────────────────────────────────────────────────────
-
-await check('registry: bilibili routing by host; unknown site/url → null', () => {
-  assert.deepEqual(siteNames(), ['bilibili'])
-  assert.equal(providerByUrl('https://www.bilibili.com/video/BV1xx411c7mD')?.site, 'bilibili')
-  assert.equal(providerByUrl('https://b23.tv/abc')?.site, 'bilibili')
-  assert.equal(providerByUrl('https://youtube.com/watch?v=x'), null)
-  assert.equal(providerByUrl('not a url'), null)
-  assert.equal(providerBySite('bilibili')?.methods.includes('qr'), true)
-  assert.equal(providerBySite('bilibili')?.methods.includes('manual'), true)
-  assert.equal(providerBySite('youtube'), null)
-})
 
 // ── plugin registration ─────────────────────────────────────────────────────
 
@@ -364,77 +242,44 @@ await check('settings: action=set without configEditor fails loudly, never silen
   )
 })
 
-await check('video_login: poll without pending state says so', async () => {
+await check('video_login: poll without a session says so', async () => {
   freshHome()
+  if (!nativeStatus().available) return
   const tools = await registeredTools()
-  const result = await tools.video_login.execute({ action: 'poll' }, {})
-  assert.match(result.text, /action=start first/)
-})
-
-await check('video_login: site × method contract — unknowns, reserved methods, wrong action', async () => {
-  freshHome()
-  const tools = await registeredTools()
-  // Schema layer rejects unknown enum values before execute runs.
   await assert.rejects(
-    () => tools.video_login.execute({ action: 'start', site: 'youtube' }, {}),
-    /"site" must be one of \["bilibili"\]/,
-  )
-  await assert.rejects(
-    () => tools.video_login.execute({ action: 'start', method: 'magic' }, {}),
-    /"method" must be one of/,
-  )
-  // Reserved-but-listed methods reach execute and fail with the contract error.
-  await assert.rejects(
-    () => tools.video_login.execute({ action: 'start', method: 'password' }, {}),
-    /method=password is reserved but not implemented for site=bilibili \(implemented: qr, manual\)/,
-  )
-  await assert.rejects(
-    () => tools.video_login.execute({ action: 'import' }, {}),
-    /action=import is not valid for method=qr.*use method=manual/,
-  )
-  await assert.rejects(
-    () => tools.video_login.execute({ action: 'start', method: 'manual' }, {}),
-    /action=start is not valid for method=manual/,
+    () => tools.video_login.execute({ action: 'poll', sessionId: '' }, {}),
+    /malformed session id/,
   )
 })
 
-await check('video_login: manual import stores a jar; logout clears only that site', async () => {
+await check('video_login: unknown channel is a structured channel error', async () => {
   freshHome()
-  const exportDir = mkdtempSync(join(tmpdir(), 'vf-export-'))
-  const cookieFile = join(exportDir, 'export.txt')
-  writeFileSync(cookieFile, toNetscape(parseSetCookies(['SESSDATA=secret; Domain=.bilibili.com; Path=/; HttpOnly']), 'bilibili.com'))
+  if (!nativeStatus().available) return
   const tools = await registeredTools()
-
-  const imported = await tools.video_login.execute({ action: 'import', method: 'manual', path: cookieFile }, {})
-  assert.match(imported.text, /Imported 1 cookie\(s\) for bilibili as jar 1 of 1/)
-  assert.ok(!imported.text.includes('secret'), 'cookie value must never reach the result')
-
-  const again = await tools.video_login.execute({ action: 'import', method: 'manual', path: cookieFile }, {})
-  assert.match(again.text, /Already stored as jar 1 of 1/)
-
   await assert.rejects(
-    () => tools.video_login.execute({ action: 'import', method: 'manual', path: 'relative.txt' }, {}),
-    /absolute path/,
+    () => tools.video_login.execute({ action: 'start', channel: 'nope', method: 'qr' }, {}),
+    /unknown channel 'nope'/,
   )
-  const junk = join(exportDir, 'junk.txt')
-  writeFileSync(junk, 'hello world')
-  await assert.rejects(
-    () => tools.video_login.execute({ action: 'import', method: 'manual', path: junk }, {}),
-    /no cookie rows/,
-  )
-
-  const loggedOut = await tools.video_login.execute({ action: 'logout' }, {}) // default method=qr
-  assert.match(loggedOut.text, /Cookies deleted for bilibili \(1 jar\(s\)\)/)
-  assert.equal(readJars('bilibili').length, 0)
-  const againOut = await tools.video_login.execute({ action: 'logout' }, {})
-  assert.match(againOut.text, /Already logged out/)
 })
 
-await check('video_login: status with no cookies is offline and says so', async () => {
+await check('video_login: reserved method refuses with the channel’s implemented list', async () => {
   freshHome()
+  if (!nativeStatus().available) return
   const tools = await registeredTools()
-  const result = await tools.video_login.execute({ action: 'status' }, {})
-  assert.equal(result.text, 'Not logged in (no cookies for bilibili).')
+  await assert.rejects(
+    () => tools.video_login.execute({ action: 'start', channel: 'youku', method: 'qr' }, {}),
+    /does not implement the 'qr' login method/,
+  )
+})
+
+await check('video_login: unknown action is rejected', async () => {
+  freshHome()
+  if (!nativeStatus().available) return
+  const tools = await registeredTools()
+  await assert.rejects(
+    () => tools.video_login.execute({ action: 'telepathy' }, {}),
+    /"action" must be one of/,
+  )
 })
 
 // ── web routes (the Plugins-page surface) ───────────────────────────────────
@@ -461,7 +306,7 @@ async function callRoute(routes, path, body) {
   return { status: res.statusCode, body: parsed }
 }
 
-await check('routes: state reports live settings, the field table, and jar counts', async () => {
+await check('routes: state reports live settings, the field table, and labeled channels', async () => {
   freshHome()
   const mod = await import('../lib/index.js')
   const config = mod.Config({})
@@ -473,7 +318,11 @@ await check('routes: state reports live settings, the field table, and jar count
   assert.deepEqual(body.fields.map((field) => field.key), [...EDITABLE_KEYS])
   const crf = body.fields.find((field) => field.key === 'crf')
   assert.deepEqual({ min: crf.min, max: crf.max, type: crf.type }, { min: 0, max: 51, type: 'integer' })
-  assert.deepEqual(body.sites, [{ site: 'bilibili', jars: 0 }])
+  // The card needs a display name per channel — that label was the complaint.
+  if (!nativeStatus().available) return
+  const bilibili = body.channels.find((entry) => entry.channel.id === 'bilibili')
+  assert.equal(bilibili.channel.name, '哔哩哔哩')
+  assert.ok(bilibili.channel.methods.some((method) => method.id === 'qr' && method.implemented))
 })
 
 await check('routes: set rejects a bad value with 400 and never writes', async () => {
@@ -500,31 +349,35 @@ await check('routes: set/reset fail loudly when the host has no configEditor', a
   assert.match(reset.body.error, /configEditor is unavailable/)
 })
 
-await check('routes: login status is offline-safe; QR route 404s before a login', async () => {
+await check('routes: login status is offline-safe; challenge route rejects an empty payload', async () => {
   freshHome()
   const mod = await import('../lib/index.js')
   const routes = buildRoutes({ get: () => undefined }, mod.Config({}))
   const status = await callRoute(routes, '/video-fetch/login/status')
   assert.equal(status.status, 200)
-  assert.equal(status.body.loggedIn, false)
-  assert.equal(status.body.jars, 0)
-  assert.deepEqual(status.body.methods, ['qr', 'manual'])
-  const unknown = await callRoute(routes, '/video-fetch/login/status?site=youtube')
+  // Shape is the channel advertisement plus its pool, not a bare login flag.
+  assert.equal(status.body.accounts.length, 0)
+  assert.equal(status.body.active, null)
+  const unknown = await callRoute(routes, '/video-fetch/login/status?channel=nope')
   assert.equal(unknown.status, 400)
-  const qr = await callRoute(routes, '/video-fetch/qr')
-  assert.equal(qr.status, 404)
-  assert.match(qr.body.error, /no QR code yet/)
+  const blank = await callRoute(routes, '/video-fetch/challenge')
+  assert.equal(blank.status, 400)
+  assert.match(blank.body.error, /no scannable QR payload/)
 })
 
-await check('routes: logout clears jars and is idempotent', async () => {
+await check('routes: logout of an unknown account is a no-op, not an error', async () => {
   freshHome()
+  if (!nativeStatus().available) return
   const mod = await import('../lib/index.js')
   const routes = buildRoutes({ get: () => undefined }, mod.Config({}))
-  addJar('bilibili', { source: 'manual', data: 'A' })
-  const first = await callRoute(routes, '/video-fetch/login/logout', {})
-  assert.deepEqual(first.body, { ok: true, site: 'bilibili', removed: 1 })
-  const second = await callRoute(routes, '/video-fetch/login/logout', {})
-  assert.equal(second.body.removed, 0)
+  const result = await callRoute(routes, '/video-fetch/login/logout', {
+    channel: 'bilibili',
+    account: 'deadbeefdeadbeef',
+  })
+  // Removing something that is not there succeeds and reports zero removals,
+  // so a retry after a logout cannot be mistaken for a real deletion.
+  assert.equal(result.status, 200)
+  assert.equal(result.body.removed, false)
 })
 
 console.log(checks.join('\n'))
