@@ -492,7 +492,17 @@ await check('commands: /video-login start → poll carries the session across in
   mod.apply(ctx, mod.Config({}))
   const login = definitions.find((d) => d.name === 'video-login')
 
+  // Network-free half: with nothing started, poll must refuse as a result
+  // rather than throw. This is the half the Nix build sandbox can check.
+  const nothing = await runCommand(login, 'poll')
+  assert.equal(nothing.kind, 'error')
+  assert.match(nothing.text, /nothing to poll/)
+
   const started = await runCommand(login, 'start bilibili qr')
+  // Minting a real QR talks to the site, and the Nix build sandbox has no
+  // network. A transport failure is "this cannot be exercised here", not a
+  // regression — same reason the rest of this file does no I/O.
+  if (started.kind === 'error' && /request failed|error sending request|timed out/i.test(started.text)) return
   assert.equal(started.kind, 'success', started.text)
   const id = /sessionId: (\S+)/.exec(started.text)
   assert.ok(id, `start must name the session: ${started.text}`)
