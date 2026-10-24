@@ -17,9 +17,20 @@ The engine that does the work is the separate, harness-independent
 C ABI, and a CLI. This plugin is only the integration shell — routes, tools, and
 the page — that loads that library and calls it.
 
-Settings are editable **two ways that write the same profile row**: the
-`video_settings` session tool and the plugin's page in the web GUI. A change
-applies to the running plugin immediately and survives a restart.
+## Where you can drive it from
+
+Three surfaces, one implementation each, all writing the same profile row — so
+they cannot disagree:
+
+| Surface | What it is | Where it works |
+| --- | --- | --- |
+| **Web page** | `plugins.row.config` card + a Settings tab | Web GUI only (the browser half declares `platform: "web"`) |
+| **Slash commands** | `/video-settings`, `/video-login` | Web composer **and** the TUI — both dispatch through the kernel's command registry |
+| **Session tools** | `video_settings`, `video_login`, `video_fetch`, `video_compress` | The model calls them, not you |
+
+The page needs a browser and the TUI never renders it; the commands are the
+only surface the TUI has. Every change applies to the running plugin
+immediately and survives a restart.
 
 ## Tools
 
@@ -52,6 +63,38 @@ It talks to the plugin's own host routes (`/video-fetch/state|set|reset|login/*|
 challenge`, mirrored under `/api` on the desktop connection) rather than the
 generic settings form, because login is not configuration and the session tool
 must share one writer with the page.
+
+## Slash commands
+
+Registered into the kernel's command registry (`@deepseek-ai/dsh-commands`), so
+the web composer and the TUI both offer them in their slash menu and dispatch
+them without sending anything to the model.
+
+```
+/video-settings                      # print the live values
+/video-settings crf=22 maxHeight=480  # write fields into the profile
+/video-settings reset crf             # drop an override, restore the default
+
+/video-login                          # every channel's accounts
+/video-login channels                 # each channel and the methods it implements
+/video-login start bilibili qr        # mint a login; prints the session and the URL
+/video-login poll                     # check it after scanning
+/video-login cancel
+/video-login pin bilibili <account>
+/video-login logout bilibili <account>
+/video-login check bilibili
+```
+
+`start` → `poll` is two command lines, so the session id is remembered between
+them; `poll <sessionId>` overrides it when two logins are in flight. A terminal
+prints the QR **URL**, not an image — open it in a browser, or use the web page
+if your channel only returns a rendered image.
+
+The registry is reached with `ctx.reflect.get('commands')` rather than
+`ctx.commands`, because cordis throws for a service the plugin does not
+declare in `inject`, and declaring it would make the whole plugin fail to load
+on a composition without the registry. Without it, downloading and the web page
+still work and only these two commands are missing.
 
 ## Configuration
 

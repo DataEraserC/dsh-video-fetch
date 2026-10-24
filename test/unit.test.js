@@ -380,5 +380,139 @@ await check('routes: logout of an unknown account is a no-op, not an error', asy
   assert.equal(result.body.removed, false)
 })
 
+// ── slash commands ─────────────────────────────────────────────────────────
+
+/**
+ * A host context whose `reflect.get` resolves the command registry, the way
+ * cordis does it for a service the plugin does not declare in `inject`.
+ * @returns {object} `{ ctx, definitions, disposers }`
+ */
+function ctxWithCommands() {
+  const definitions = []
+  return {
+    definitions,
+    ctx: {
+      tools: { register: () => {} },
+      reflect: {
+        get: (name) => (
+          name === 'commands'
+            ? { register: (definition) => { definitions.push(definition); return () => {} } }
+            : undefined
+        ),
+      },
+    },
+  }
+}
+
+/** @param {object} definition - a registered command. @param {string} tail - text after the name. */
+function runCommand(definition, tail) {
+  return definition.handler({ rawInput: tail })
+}
+
+await check('commands: register into the registry, and are skipped when it is absent', async () => {
+  freshHome()
+  const mod = await import('../lib/index.js')
+
+  const with_ = ctxWithCommands()
+  mod.apply(with_.ctx, mod.Config({}))
+  assert.deepEqual(with_.definitions.map((d) => d.name), ['video-settings', 'video-login'])
+  // Discovery copy and the input hint are what a composer's slash menu shows.
+  for (const definition of with_.definitions) {
+    assert.ok(definition.description.length > 0, `${definition.name} needs a description`)
+    assert.ok(definition.input.hint.length > 0, `${definition.name} needs an input hint`)
+  }
+
+  // No `reflect` at all: the plugin must still load, just without commands.
+  const without = { tools: { register: () => {} } }
+  mod.apply(without, mod.Config({}))
+})
+
+await check('commands: /video-settings reads, writes, and rejects a bad field', async () => {
+  freshHome()
+  const { ctx, definitions } = ctxWithCommands()
+  const mod = await import('../lib/index.js')
+  mod.apply(ctx, mod.Config({}))
+  const settings = definitions.find((d) => d.name === 'video-settings')
+
+  // `rawInput` keeps the separator whitespace; an empty tail is "" or " ".
+  const read = await runCommand(settings, '')
+  assert.equal(read.kind, 'success')
+  assert.match(read.text, /crf = 26/)
+  assert.match(read.text, /downloadEngine = "ytdlp"/)
+  const spaced = await runCommand(settings, '   ')
+  assert.equal(spaced.kind, 'success', 'a whitespace-only tail is still "no arguments"')
+
+  // No configEditor in this composition: the write must fail as a result, not
+  // as a thrown error an adapter would surface as a crash.
+  const bad = await runCommand(settings, 'crf=99')
+  assert.equal(bad.kind, 'error')
+  assert.match(bad.text, /must be 0-51/)
+  const unknown = await runCommand(settings, 'nope=1')
+  assert.equal(unknown.kind, 'error')
+  assert.match(unknown.text, /unknown setting/)
+  const shapeless = await runCommand(settings, 'crf')
+  assert.equal(shapeless.kind, 'error')
+  assert.match(shapeless.text, /expected <field>=<value>/)
+  const write = await runCommand(settings, 'crf=22')
+  assert.equal(write.kind, 'error')
+  assert.match(write.text, /configEditor is unavailable/)
+})
+
+await check('commands: /video-login reports the backend when it is missing', async () => {
+  freshHome()
+  const { ctx, definitions } = ctxWithCommands()
+  const mod = await import('../lib/index.js')
+  mod.apply(ctx, mod.Config({}))
+  const login = definitions.find((d) => d.name === 'video-login')
+
+  const result = await runCommand(login, '')
+  if (nativeStatus().available) {
+    assert.equal(result.kind, 'success')
+    assert.match(result.text, /account\(s\)/, 'status lists each channel’s pool')
+  } else {
+    assert.equal(result.kind, 'error')
+    assert.match(result.text, /login backend is unavailable/)
+  }
+
+  // Unknown subcommands and missing arguments are results, never throws.
+  const bogus = await runCommand(login, 'frobnicate')
+  if (nativeStatus().available) {
+    assert.equal(bogus.kind, 'error')
+    assert.match(bogus.text, /unknown subcommand/)
+  }
+  const nostart = await runCommand(login, 'start')
+  assert.notEqual(nostart.kind, 'success')
+})
+
+await check('commands: /video-login start → poll carries the session across invocations', async () => {
+  freshHome()
+  if (!nativeStatus().available) return
+  const { ctx, definitions } = ctxWithCommands()
+  const mod = await import('../lib/index.js')
+  mod.apply(ctx, mod.Config({}))
+  const login = definitions.find((d) => d.name === 'video-login')
+
+  const started = await runCommand(login, 'start bilibili qr')
+  assert.equal(started.kind, 'success', started.text)
+  const id = /sessionId: (\S+)/.exec(started.text)
+  assert.ok(id, `start must name the session: ${started.text}`)
+  assert.match(started.text, /\/video-login poll/, 'start must say what comes next')
+
+  // A separate invocation — the session lives in the native layer, so the
+  // command only has to remember the id.
+  // Nobody scanned, so this must report still-waiting. Asserted without
+  // matching the wording: the message comes from the provider's own copy,
+  // which is Chinese for bilibili.
+  const polled = await runCommand(login, 'poll')
+  assert.equal(polled.kind, 'success', polled.text)
+  assert.ok(polled.text.trim().length > 0, 'poll must say something')
+  assert.doesNotMatch(polled.text, /Logged in/, 'an unscanned QR cannot be done')
+
+  const cancelled = await runCommand(login, 'cancel')
+  assert.equal(cancelled.kind, 'success')
+  const after = await runCommand(login, 'poll')
+  assert.equal(after.kind, 'error', 'after cancel there is nothing left to poll')
+})
+
 console.log(checks.join('\n'))
 console.log(`\n${checks.filter((c) => c.startsWith('ok')).length}/${checks.length} passed`)
