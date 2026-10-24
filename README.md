@@ -149,10 +149,13 @@ user override via `ytdlpBinary` / `ffmpegBinary` still wins.
 
 ## Security
 
-- Login cookies are stored **per channel** in
-  `DSH_HOME/video-fetch/accounts/<channel>.json` (mode `0600`, at most 10
-  accounts) and are **never** included in tool results, logs, HTTP responses,
-  or commits. `video_fetch` materializes one account's cookies to a `0600` file,
+- Login cookies are stored **per channel** in `accounts/<channel>.json` (mode
+  `0600`, at most 10 accounts) and are **never** included in tool results,
+  logs, HTTP responses, or commits. The parent directory is this harness's
+  video-fetch directory when the harness names one (`DSH_HOME/video-fetch`),
+  and the library's own default otherwise; the plugin exports it to the library
+  as `VLOGIN_HOME`, because the library itself is harness-independent and does
+  not read `DSH_HOME`. `video_fetch` materializes one account's cookies to a `0600` file,
   hands the *path* to the engine, and rotates to the next account when the site
   rejects one. `logout` removes one account; `clear` removes the channel's.
 - The web routes return login state, account labels and identities, and cookie
